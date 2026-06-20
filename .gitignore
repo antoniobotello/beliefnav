@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+belief_env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Logs / outputs
+logs/
+runs/
+outputs/
+results/
+checkpoints/
+wandb/
+tensorboard/
+*.log
+
+# Models / large files
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.pkl
+*.npy
+*.npz
+
+# Env variables / secrets
+.env
+.env.*
+secrets.json
