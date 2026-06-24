@@ -21,14 +21,14 @@ class CandidateScorer:
 
         return best_candidate
 
-    def score(self, env, candidate):
+    def score(self, env, candidate) -> float:
         candidate = np.array(
             [candidate["x"], candidate["y"], candidate["theta"]],
             dtype=np.float32,
         )
         visible_belief = self._compute_visible_belief_per_candidate(env, candidate)
         path_cost = self._compute_distance_to(env, candidate)
-        visible_unknown_area = self._compute_visible_belief_per_candidate(
+        visible_unknown_area = self._compute_visible_unknown_area_per_candidate(
             env, candidate
         )
 
@@ -45,7 +45,7 @@ class CandidateScorer:
 
         return float(visible_belief)
 
-    def _compute_distance_to(self, env, candidate: np.ndarray):
+    def _compute_distance_to(self, env, candidate: np.ndarray) -> float:
         path_cost = np.linalg.norm(candidate[:2] - env.robot_pose[:2])
         return path_cost
 

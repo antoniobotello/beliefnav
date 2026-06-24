@@ -10,10 +10,10 @@ matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.axes import Axes
 from matplotlib.colors import ListedColormap, BoundaryNorm
+from matplotlib.patches import Circle, Wedge
 from samplers.frontier_sampler import FrontierSampler
+from samplers.belief_sampler import BeliefSampler
 from samplers.candidate_scorer import CandidateScorer
-
-num_rays = 90
 
 
 class TargetSearchEnv(gym.Env):
@@ -37,65 +37,62 @@ class TargetSearchEnv(gym.Env):
             low=np.array([0.0, -0.5], dtype=np.float32),
             high=np.array([3.0, 0.5], dtype=np.float32),
             dtype=np.float32,
-        )  # 2x2 vector. First column indicates v (range 0.0 to 1.0), second indicates w (range from -0.5 to 0.5)
+        )
+
+        # Later: RL chooses between explore, exploit, reposition
         # self.action_space = spaces.Discrete(3)
         # self._action_to_strategy = ["explore", "exploit", "reposition"]
-        # 0 = explore
-        # 1 = exploit
-        # 2 = reposition
 
         # * Observation
-        # TODO: Agrega el occupany map
         self.observation_space = spaces.Box(
             low=0.0,
             high=1.0,
             shape=(grid_size, grid_size),
             dtype=np.float32,
-        )  # Observation represents the belief map, therefore the range goes from 0.0 to 1.0
+        )
 
         # * Target
         self.target_pos = None
         self.target_vel = None
         self.target_speed = 0.5
-        self.dt = 1.0
-
-        self.step_count = 0
         self.target_found = False
 
         # * Robot
-        self.robot_pose: np.ndarray = None  # [x, y, theta]
-        self.robot_pos = None
+        self.robot_pose = None  # [x, y, theta]
 
-        # * Belief Map (Uniform Prior)
-        self.belief_map = np.ones((grid_size, grid_size), dtype=np.float32)
-        self.belief_map /= self.belief_map.sum()
+        # * Dynamics
+        self.dt = 1.0
 
-        # * Occupancy Grid (Known by the robot)
-        # -1 = unknown
-        #  0 = free
-        #  1 = obstacle
-        self.occupancy_grid = -np.ones((grid_size, grid_size), dtype=np.int8)
+        # * Maps
+        self.occupancy_grid = None
+        self.true_map = None
+        self.belief_map = None
 
         # * Paths
         self.robot_path = []
         self.candidate_paths = []
         self.best_path = None
 
-        # * Sensor
-        self.sensor_range = 10.0
-        self.fov_angle = np.deg2rad(90)  # 90 degrees field of view
+        # * LiDAR Sensor
+        self.sensor_range = 5.0
+        self.fov_angle = 2 * np.pi
+        # self.fov_angle = np.deg2rad(90)
+        self.num_rays = 360
 
+        # * Rendering
         self.fig = None
         self.ax = None
 
         # * Samplers
         self.frontier_sampler = FrontierSampler()
+        self.belief_sampler = BeliefSampler()
 
         # * Candidate Scorer
         self.candidate_scorer = CandidateScorer()
 
     def reset(self, seed=None, options=None) -> tuple[np.ndarray, dict]:
         super().reset(seed=seed)
+        self.target_found = False
 
         self.step_count = 0
 
@@ -104,7 +101,7 @@ class TargetSearchEnv(gym.Env):
         self.robot_path = [self.robot_pose[:2].copy()]
 
         # * Target
-        self.target_pos = np.array([40.0, 30.0], dtype=np.float32)
+        self.target_pos = np.array([80.0, 80.0], dtype=np.float32)
         target_angle = np.deg2rad(135)
 
         self.target_vel = self.target_speed * np.array(
@@ -124,11 +121,11 @@ class TargetSearchEnv(gym.Env):
         # * Real map known only by the simulator
         self.true_map = np.zeros((self.grid_size, self.grid_size), dtype=np.int8)
 
-        # TODO: El robot no puede pasar por en medio de los obtaculos
+        # * Obstacles
         self.true_map[10:30, 10:20] = 1
-        self.true_map[25:45, 22:32] = 1
-        self.true_map[70:80, 10:15] = 1
-        self.true_map[50:70, 80:90] = 1
+        self.true_map[30:80, 45:55] = 1
+        self.true_map[60:80, 20:30] = 1
+        self.true_map[20:50, 80:90] = 1
 
         # # Add border walls
         self.true_map[0, :] = 1  # bottom wall
@@ -140,9 +137,7 @@ class TargetSearchEnv(gym.Env):
         self.best_path = None
 
         # Initial sensing before first action
-        visible_mask = self._ray_casting_visibility(
-            pose=self.robot_pose, num_rays=num_rays
-        )
+        visible_mask = self._ray_casting_visibility(pose=self.robot_pose)
         self._update_occupancy_grid(visible_mask)
 
         # If there is no obstacle
@@ -164,7 +159,6 @@ class TargetSearchEnv(gym.Env):
 
         self.step_count += 1
 
-        #####################
         # strategy = self._action_to_strategy[action]
         strategy = "explore"  # hardcoded
         # strategy = "exploit"
@@ -187,11 +181,6 @@ class TargetSearchEnv(gym.Env):
         else:
             self._move_robot_to_candidate(best_candidate)
 
-        #####################
-
-        # * Robot's Position Update at new step
-        # self._move_robot(action)
-
         # * Target's Position Update at new step
         self._move_target_constant_velocity()
 
@@ -199,9 +188,7 @@ class TargetSearchEnv(gym.Env):
         self._predict_belief_motion()
 
         # * Ray casting
-        visible_mask = self._ray_casting_visibility(
-            pose=self.robot_pose, num_rays=num_rays
-        )
+        visible_mask = self._ray_casting_visibility(pose=self.robot_pose)
 
         # * Check if the target was detected
         target_cell = np.round(self.target_pos).astype(
@@ -543,91 +530,71 @@ class TargetSearchEnv(gym.Env):
     def _draw_fov(self, ax: Axes) -> None:
         x, y, theta = self.robot_pose
 
+        if np.isclose(self.fov_angle, 2 * np.pi):
+            lidar_range = Circle(
+                (x, y),
+                radius=self.sensor_range,
+                alpha=0.18,
+                zorder=3,
+            )
+            ax.add_patch(lidar_range)
+            return
+
         left_angle = theta - self.fov_angle / 2
         right_angle = theta + self.fov_angle / 2
 
-        left_point = np.array(
-            [
-                x + self.sensor_range * np.cos(left_angle),
-                y + self.sensor_range * np.sin(left_angle),
-            ]
-        )
-
-        right_point = np.array(
-            [
-                x + self.sensor_range * np.cos(right_angle),
-                y + self.sensor_range * np.sin(right_angle),
-            ]
-        )
-
-        polygon = np.array(
-            [
-                [x, y],
-                left_point,
-                right_point,
-            ]
-        )
-
-        ax.fill(
-            polygon[:, 0],
-            polygon[:, 1],
+        fov = Wedge(
+            center=(x, y),
+            r=self.sensor_range,
+            theta1=np.rad2deg(left_angle),
+            theta2=np.rad2deg(right_angle),
             alpha=0.25,
             zorder=3,
         )
 
-    def _ray_casting_visibility(
-        self, pose: np.ndarray, num_rays: int = num_rays
-    ) -> np.ndarray:
-        """
-        Computes the visible cells from the robot pose using ray casting.
+        ax.add_patch(fov)
 
-        The function:
-        1. takes the current robot pose,
-        2. casts multiple rays inside the robot field of view,
-        3. advances each ray cell by cell,
-        4. marks cells as visible,
-        5. stops a ray when it hits an obstacle,
-        6. returns a boolean visible_mask.
-
-        Returns:
-            visible_mask: Boolean grid where True means the cell is visible.
+    def _ray_casting_visibility(self, pose: np.ndarray) -> np.ndarray:
         """
-        # x, y, theta = self.robot_pose
+        Computes the visible cells from a pose using simulated 2D LiDAR ray casting.
+        For 360-degree LiDAR, rays are cast in all directions around the robot.
+        """
         x, y, theta = pose
 
         visible_mask = np.zeros((self.grid_size, self.grid_size), dtype=bool)
 
-        angles = np.linspace(
-            theta - self.fov_angle / 2,
-            theta + self.fov_angle / 2,
-            num_rays,
-        )  # Ray angles range
+        if np.isclose(self.fov_angle, 2 * np.pi):
+            # endpoint=False avoids duplicating 0 and 2*pi, which represent the same ray direction.
+            angles = np.linspace(
+                0.0,
+                2 * np.pi,
+                self.num_rays,
+                endpoint=False,
+            )
+        else:
+            angles = np.linspace(
+                theta - self.fov_angle / 2,
+                theta + self.fov_angle / 2,
+                self.num_rays,
+            )
 
-        # Convert the robot's position into a grid cell
         x0 = int(round(x))
         y0 = int(round(y))
 
-        # Shot a ray for every ray insie the ray angles range
         for angle in angles:
-            # Get the ray's final point
             x1 = int(round(x + self.sensor_range * np.cos(angle)))
             y1 = int(round(y + self.sensor_range * np.sin(angle)))
 
-            rr, cc = line(
-                y0, x0, y1, x1
-            )  # Get the cells saw by the ray. rr (rows) -> y and cc (columns) -> x
+            rr, cc = line(y0, x0, y1, x1)
 
             for iy, ix in zip(rr, cc):
                 if ix < 0 or ix >= self.grid_size or iy < 0 or iy >= self.grid_size:
-                    break  # If ray outside the grid, stop it
+                    break
 
                 visible_mask[iy, ix] = True
 
-                # The ground-truth map is only used internally by the simulator to generate
-                # simulated sensor observations. The robot/agent does not receive this map;
-                # it only receives the partially observed occupancy_grid.
                 if self.true_map[iy, ix] == 1:
-                    break  # if cell is an obstacle, stop it
+                    break
 
         return visible_mask
 
@@ -707,7 +674,6 @@ class TargetSearchEnv(gym.Env):
         # =====================================================
         # 2. BELIEF MAP
         # =====================================================
-        # belief_display = self.belief_map.copy()
 
         # if belief_display.max() > 0:
         #     belief_display = belief_display / belief_display.max()
