@@ -3,6 +3,8 @@ from gymnasium import spaces
 import numpy as np
 from typing import List, Dict
 from skimage.draw import line
+from skimage.graph import route_through_array  # A* library
+from scipy.ndimage import distance_transform_edt
 
 import matplotlib
 
@@ -13,6 +15,7 @@ from matplotlib.colors import ListedColormap, BoundaryNorm
 from matplotlib.patches import Circle, Wedge
 from samplers.frontier_sampler import FrontierSampler
 from samplers.belief_sampler import BeliefSampler
+from samplers.reposition_sampler import RepositionSampler
 from samplers.candidate_scorer import CandidateScorer
 
 
@@ -54,19 +57,21 @@ class TargetSearchEnv(gym.Env):
         # * Target
         self.target_pos = None
         self.target_vel = None
-        self.target_speed = 0.5
+        self.target_speed = 1.0
         self.target_found = False
 
         # * Robot
         self.robot_pose = None  # [x, y, theta]
+        self.robot_cells_per_step = 2
 
         # * Dynamics
-        self.dt = 1.0
+        self.dt = 0.5
 
         # * Maps
         self.occupancy_grid = None
         self.true_map = None
         self.belief_map = None
+        self.obstacle_distance_map = None
 
         # * Paths
         self.robot_path = []
@@ -83,9 +88,22 @@ class TargetSearchEnv(gym.Env):
         self.fig = None
         self.ax = None
 
-        # * Samplers
-        self.frontier_sampler = FrontierSampler()
-        self.belief_sampler = BeliefSampler()
+        # * High Level Samplers
+        # * Frontier Sampler
+        self.frontier_sampler = FrontierSampler(num_candidates=30)
+        self.active_frontier_direction = None
+        self.active_frontier_direction = None  # np.array([cos(angle), sin(angle)])
+
+        self.belief_sampler = BeliefSampler(belief_regions=5, candidates_per_region=4)
+        self.reposition_sampler = RepositionSampler(
+            n_candidates=30, max_attempts=500, min_clerance=3
+        )
+
+        # * Low Level Planner
+        self.current_goal = None
+        self.current_path = []
+        self.steps_since_replan = 0
+        self.replan_interval = 5
 
         # * Candidate Scorer
         self.candidate_scorer = CandidateScorer()
@@ -93,6 +111,10 @@ class TargetSearchEnv(gym.Env):
     def reset(self, seed=None, options=None) -> tuple[np.ndarray, dict]:
         super().reset(seed=seed)
         self.target_found = False
+
+        self.current_goal = None
+        self.current_path = []
+        self.steps_since_replan = 0
 
         self.step_count = 0
 
@@ -139,6 +161,7 @@ class TargetSearchEnv(gym.Env):
         # Initial sensing before first action
         visible_mask = self._ray_casting_visibility(pose=self.robot_pose)
         self._update_occupancy_grid(visible_mask)
+        self._update_obstacle_distance_map()
 
         # If there is no obstacle
         free_visible_mask = visible_mask & (self.true_map == 0)
@@ -159,27 +182,57 @@ class TargetSearchEnv(gym.Env):
 
         self.step_count += 1
 
+        # if self.step_count < int(self.max_steps / 3):
+        #     strategy = "explore"
+        # elif self.step_count < 2 * int(self.max_steps / 3):
+        #     strategy = "reposition"
+        # else:
+        #     strategy = "exploit"
+
+        # TODO: Stratgy choosen with RL and not Hardcoded
         # strategy = self._action_to_strategy[action]
-        strategy = "explore"  # hardcoded
+
+        # # * Hardcoded strategies
+        strategy = "explore"
         # strategy = "exploit"
         # strategy = "reposition"
 
-        if strategy == "explore":
-            candidates = self.frontier_sampler.sample(self)
-        elif strategy == "exploit":
-            candidates = self.belief_sampler.sample(self)
-        elif strategy == "reposition":
-            candidates = self.reposition_sampler.sample(self)
-        else:
-            raise ValueError(f"Unknown strategy: {strategy}")
+        best_candidate = None
 
-        best_candidate = self.candidate_scorer.select_best(self, candidates)
-        # best_candidate = candidates[0] if len(candidates) > 0 else None
+        # if self._should_replan():
+        #     best_candidate = self._select_new_candidate(strategy)
 
-        if best_candidate is None:
-            self._move_robot(action)
-        else:
-            self._move_robot_to_candidate(best_candidate)
+        #     if best_candidate is not None:
+        #         path_found = self._plan_path_to_candidate(best_candidate)
+
+        #         if not path_found:
+        #             self.current_goal = None
+        #             self.current_path = []
+        #             self.steps_since_replan = 0
+
+        path_found = False
+        replanned = False
+
+        if self._should_replan():
+            replanned = True
+            best_candidate = self._select_new_candidate(strategy)
+
+            if best_candidate is not None:
+                path_found = self._plan_path_to_candidate(best_candidate)
+
+                if path_found:
+                    # Commit to the frontier region only if the candidate was accepted
+                    if best_candidate.get("source") == "frontier":
+                        self.active_frontier_direction = best_candidate[
+                            "cluster_direction"
+                        ]
+
+                else:
+                    self.current_goal = None
+                    self.current_path = []
+                    self.steps_since_replan = 0
+
+        self._follow_current_path()
 
         # * Target's Position Update at new step
         self._move_target_constant_velocity()
@@ -202,6 +255,7 @@ class TargetSearchEnv(gym.Env):
 
         # * Mapping update: what the robot knows about obstacles/free space
         self._update_occupancy_grid(visible_mask)
+        self._update_obstacle_distance_map()
 
         # * Belief correction: where the robot looked and did not see the target
         # TODO: Comprueba si esta free visible mask es valida
@@ -222,90 +276,181 @@ class TargetSearchEnv(gym.Env):
         reward = -0.1
 
         obs = self._get_obs()
+        # info = {
+        #     "visible_mask": visible_mask,
+        #     "robot_pose": self.robot_pose.copy(),
+        #     "strategy": strategy,
+        #     "current_goal": self.current_goal,
+        #     "current_path": self.current_path,
+        #     "steps_since_replan": self.steps_since_replan,
+        #     "target_found": target_found,
+        # }
         info = {
             "visible_mask": visible_mask,
             "robot_pose": self.robot_pose.copy(),
             "strategy": strategy,
-            "candidates": candidates,
+            "replanned": replanned,
+            "path_found": path_found,
             "best_candidate": best_candidate,
+            "current_goal": self.current_goal,
+            "current_path": self.current_path,
+            "steps_since_replan": self.steps_since_replan,
             "target_found": target_found,
         }
 
         return obs, reward, terminated, truncated, info
 
-    def _move_robot(self, action) -> None:
-        v, omega = action
+    def _select_new_candidate(self, strategy: str) -> dict | None:
+        if strategy == "explore":
+            candidates = self.frontier_sampler.sample(self)
+        elif strategy == "exploit":
+            candidates = self.belief_sampler.sample(self)
+        elif strategy == "reposition":
+            candidates = self.reposition_sampler.sample(self)
+        else:
+            raise ValueError(f"Unknown strategy: {strategy}")
 
-        x, y, theta = self.robot_pose
+        if len(candidates) == 0:
+            return None
 
-        # Apply rotation first
-        theta = theta + omega
-        theta = (theta + np.pi) % (2 * np.pi) - np.pi
+        return self.candidate_scorer.select_best(self, candidates)
 
-        # Proposed motion
-        dx = v * np.cos(theta)
-        dy = v * np.sin(theta)
+    def _should_replan(self) -> bool:
+        if self.current_goal is None:
+            return True
 
-        proposed_x = x + dx
-        proposed_y = y + dy
+        if len(self.current_path) < 2:
+            return True
 
-        proposed_x = np.clip(proposed_x, 0, self.grid_size - 1)
-        proposed_y = np.clip(proposed_y, 0, self.grid_size - 1)
+        if self.steps_since_replan >= self.replan_interval:
+            return True
 
-        # Check collision separately in x and y direction
-        collision_x = self._position_in_collision(proposed_x, y)
-        collision_y = self._position_in_collision(x, proposed_y)
+        next_y, next_x = self.current_path[1]
 
-        # Bounce: reverse the component that hits the obstacle
-        if collision_x:
-            dx *= -1.0
+        if self._position_blocked_in_known_map(next_x, next_y):
+            return True
 
-        if collision_y:
-            dy *= -1.0
+        return False
 
-        # If collision happened, update orientation according to reflected motion
-        if collision_x or collision_y:
-            theta = np.arctan2(dy, dx)
+    def _update_obstacle_distance_map(self) -> None:
+        obstacle_mask = self.occupancy_grid == 1
+        free_space_mask = ~obstacle_mask
 
-        new_x = x + dx
-        new_y = y + dy
+        self.obstacle_distance_map = distance_transform_edt(free_space_mask)
 
-        new_x = np.clip(new_x, 0, self.grid_size - 1)
-        new_y = np.clip(new_y, 0, self.grid_size - 1)
+    def _candidate_is_reachable(self, candidate: dict) -> bool:
+        path = self._get_path_to_candidate(candidate)
+        return path is not None
 
-        # If the reflected position is still invalid, stay in place
-        if self._position_in_collision(new_x, new_y):
-            self.robot_pose = np.array([x, y, theta], dtype=np.float32)
+    def _get_path_to_candidate(self, candidate: dict) -> list | None:
+        x_start, y_start, _ = self.robot_pose
+
+        x_goal = int(round(candidate["x"]))
+        y_goal = int(round(candidate["y"]))
+        # x_goal, y_goal, _ = candidate
+
+        start = (int(round(y_start)), int(round(x_start)))
+        goal = (y_goal, x_goal)
+
+        if self._position_blocked_in_known_map(x_goal, y_goal):
+            return None
+
+        cost_array = np.ones_like(self.occupancy_grid, dtype=float)
+        cost_array[self.occupancy_grid == -1] = np.inf
+        cost_array[self.occupancy_grid == 1] = np.inf
+        cost_array[self.occupancy_grid == 0] = 1.0
+
+        try:
+            path, cost = route_through_array(
+                cost_array,
+                start=start,
+                end=goal,
+                fully_connected=True,
+            )
+        except ValueError:
+            return None
+
+        if len(path) < 2:
+            return None
+
+        return list(path)
+
+    def _plan_path_to_candidate(self, candidate: dict) -> bool:
+        path = self._get_path_to_candidate(candidate)
+
+        if path is None:
+            return False
+
+        self.current_goal = candidate
+        self.current_path = path
+        self.steps_since_replan = 0
+
+        return True
+
+    def _follow_current_path(self) -> None:
+        if len(self.current_path) < 2:
             return
 
-        self.robot_pose = np.array([new_x, new_y, theta], dtype=np.float32)
+        x_old, y_old, _ = self.robot_pose
+        moved = False
+
+        cells_to_move = int(self.robot_cells_per_step)
+
+        for _ in range(cells_to_move):
+            if len(self.current_path) < 2:
+                break
+
+            next_y, next_x = self.current_path[1]
+
+            if self._position_blocked_in_known_map(next_x, next_y):
+                break
+
+            self.current_path.pop(0)
+
+            moved = True
+
+        if not moved:
+            return
+
+        y_new, x_new = self.current_path[0]
+
+        dx = x_new - x_old
+        dy = y_new - y_old
+        theta = np.arctan2(dy, dx)
+
+        self.robot_pose = np.array(
+            [float(x_new), float(y_new), theta],
+            dtype=np.float32,
+        )
+
         self.robot_path.append(self.robot_pose[:2].copy())
 
-    def _position_in_collision(self, x: float, y: float) -> bool:
+        self.steps_since_replan += 1
+
+    # def _position_in_collision(self, x: float, y: float) -> bool:
+    #     ix = int(round(x))
+    #     iy = int(round(y))
+
+    #     if ix < 0 or ix >= self.grid_size or iy < 0 or iy >= self.grid_size:
+    #         return True
+
+    #     return self.true_map[iy, ix] == 1
+
+    def _position_blocked_in_known_map(self, x: float, y: float) -> bool:
         ix = int(round(x))
         iy = int(round(y))
 
         if ix < 0 or ix >= self.grid_size or iy < 0 or iy >= self.grid_size:
             return True
 
-        return self.true_map[iy, ix] == 1
+        # unknown and obstacle are blocked
+        return self.occupancy_grid[iy, ix] != 0
 
     def is_valid_free_cell(self, x: int, y: int) -> bool:
         if x < 0 or x >= self.grid_size or y < 0 or y >= self.grid_size:
             return False
 
-        return self.occupancy_grid[y, x] == 0 and self.true_map[y, x] == 0
-
-    def _move_robot_to_candidate(self, candidate: dict) -> None:
-        x = float(candidate["x"])
-        y = float(candidate["y"])
-        theta = float(candidate["theta"])
-
-        if self._position_in_collision(x, y):
-            return
-
-        self.robot_pose = np.array([x, y, theta], dtype=np.float32)
-        self.robot_path.append(self.robot_pose[:2].copy())
+        return self.occupancy_grid[y, x] == 0
 
     def _get_obs(self) -> np.ndarray:
         return self.belief_map.copy()
@@ -554,12 +699,19 @@ class TargetSearchEnv(gym.Env):
 
         ax.add_patch(fov)
 
-    def _ray_casting_visibility(self, pose: np.ndarray) -> np.ndarray:
+    def _ray_casting_visibility(self, pose: dict | np.ndarray) -> np.ndarray:
         """
         Computes the visible cells from a pose using simulated 2D LiDAR ray casting.
         For 360-degree LiDAR, rays are cast in all directions around the robot.
         """
-        x, y, theta = pose
+        if isinstance(pose, dict):
+            x, y, theta = pose["x"], pose["y"], pose["theta"]
+        elif isinstance(pose, np.ndarray):
+            x, y, theta = pose
+        else:
+            raise ValueError(
+                f"Data Type: {type(pose)} not supported for the robot pose."
+            )
 
         visible_mask = np.zeros((self.grid_size, self.grid_size), dtype=bool)
 
